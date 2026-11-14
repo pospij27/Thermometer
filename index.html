@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My Thermometer</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --fg:#1d232b; --mute:#6b7480; --acc:#e4572e; --acc2:#2e86ab; --line:#e3e6ea; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14171b; --card:#1e2329; --fg:#e8ebee; --mute:#8b95a1; --line:#2c333b; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width: 960px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.3rem; margin: 4px 0 12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:12px; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  button { font: inherit; padding: 9px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor:pointer; }
+  button.primary { background: var(--acc2); color:#fff; border-color: transparent; }
+  button:disabled { opacity: .5; cursor: default; }
+  label { font-size: .9rem; color: var(--mute); display:flex; flex-direction:column; gap:4px; }
+  input, select { font: inherit; padding: 7px 8px; border-radius: 8px; border:1px solid var(--line); background: var(--bg); color: var(--fg); width: 120px; }
+  .tiles { display:grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap:10px; }
+  .tile { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; }
+  .tile .k { font-size:.8rem; color:var(--mute); }
+  .tile .v { font-size:1.5rem; font-weight:600; margin-top:2px; }
+  .tile .s { font-size:.8rem; color:var(--mute); margin-top:2px; }
+  #status { font-size:.9rem; color:var(--mute); min-height:1.2em; }
+  progress { width: 100%; height: 8px; }
+  .chartbox { position: relative; height: 320px; }
+  .warn { color: var(--acc); }
+  table { width:100%; border-collapse: collapse; font-size:.85rem; }
+  th, td { text-align:right; padding:4px 6px; border-bottom:1px solid var(--line); }
+  th:first-child, td:first-child { text-align:left; }
+  details summary { cursor:pointer; color: var(--mute); }
+</style>
+</head>
+<body>
+<main>
+  <h1>🌡️ <span id="devName">My Thermometer</span></h1>
+
+  <div id="noBt" class="card warn" hidden>
+    This browser has no Web Bluetooth. Use Chrome or Edge on desktop/Android (on iPhone use the "Bluefy" browser).
+    Previously downloaded data is still shown below.
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="btnConnect" class="primary">Connect</button>
+      <button id="btnRead" disabled>Download history</button>
+      <button id="btnTime" disabled>Sync clock</button>
+      <button id="btnCsv" disabled>Export CSV</button>
+      <button id="btnDisconnect" disabled>Disconnect</button>
+    </div>
+    <p id="status">Not connected.</p>
+    <progress id="prog" value="0" max="1" hidden></progress>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <label>Last days <input id="setDays" type="number" min="0.04" step="0.5" value="7"></label>
+      <label>Unit
+        <select id="setUnit"><option value="C">°C</option><option value="F">°F</option></select>
+      </label>
+      <label>Device clock
+        <select id="setClock"><option value="local">Local time</option><option value="utc">UTC</option></select>
+      </label>
+      <label>Smoothing (points)
+        <input id="setSmooth" type="number" min="1" step="1" value="1">
+      </label>
+      <label>Show battery
+        <select id="setBatt"><option value="0">No</option><option value="1">Yes</option></select>
+      </label>
+    </div>
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <div class="card" style="margin-top:12px">
+    <div class="chartbox"><canvas id="chart"></canvas></div>
+  </div>
+
+  <div class="card">
+    <details>
+      <summary>Daily summary</summary>
+      <div id="daily"></div>
+    </details>
+  </div>
+</main>
+
+<script>
+// ---- pvvx ATC_MiThermometer BLE protocol ----
+const SVC_CMD = 0x1f10, CHR_CMD = 0x1f1f;           // command/notify characteristic
+const CMD_UTC_TIME = 0x23, CMD_LOGGER = 0x35;        // set clock, read history
+const SVC_ENV = 0x181a, CHR_TEMP = 0x2a6e, CHR_HUM = 0x2a6f;
+const SVC_BATT = 0x180f, CHR_BATT = 0x2a19;
+const CHUNK = 250;                                   // records per request
+
+const $ = id => document.getElementById(id);
+const S = { device:null, server:null, cmd:null, records:[], live:{}, chart:null };
+
+// ---- settings (saved in browser) ----
+const SETTINGS = ['setDays','setUnit','setClock','setSmooth','setBatt'];
+function loadSettings() {
+  try {
+    const s = JSON.parse(localStorage.getItem('thermo.settings') || '{}');
+    SETTINGS.forEach(k => { if (s[k] != null) $(k).value = s[k]; });
+    const r = JSON.parse(localStorage.getItem('thermo.records') || '[]');
+    if (Array.isArray(r)) S.records = r;
+    const n = localStorage.getItem('thermo.name'); if (n) $('devName').textContent = n;
+  } catch (e) {}
+}
+function saveSettings() {
+  try { localStorage.setItem('thermo.settings', JSON.stringify(Object.fromEntries(SETTINGS.map(k => [k, $(k).value])))); } catch (e) {}
+}
+function saveRecords() { try { localStorage.setItem('thermo.records', JSON.stringify(S.records)); } catch (e) {} }
+const cfg = () => ({
+  days: Math.max(0.04, parseFloat($('setDays').value) || 7),
+  unit: $('setUnit').value,
+  local: $('setClock').value === 'local',
+  smooth: Math.max(1, parseInt($('setSmooth').value) || 1),
+  batt: $('setBatt').value === '1',
+});
+
+// device timestamp (seconds) -> real epoch ms
+function devToMs(t) {
+  if (!cfg().local) return t * 1000;
+  const guess = t * 1000;
+  return guess + new Date(guess).getTimezoneOffset() * 60000;
+}
+const fmtT = c => cfg().unit === 'F' ? c * 9 / 5 + 32 : c;
+const unitLbl = () => cfg().unit === 'F' ? '°F' : '°C';
+const status = t => $('status').textContent = t;
+
+// ---- connection ----
+async function connect() {
+  try {
+    status('Choose your thermometer…');
+    S.device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'ATC' }, { namePrefix: 'LYWSD03' }, { namePrefix: 'MJWSD' }, { services: [SVC_CMD] }],
+      optionalServices: [SVC_CMD, SVC_ENV, SVC_BATT],
+    });
+    S.device.addEventListener('gattserverdisconnected', onDisconnected);
+    status('Connecting…');
+    S.server = await S.device.gatt.connect();
+    const svc = await S.server.getPrimaryService(SVC_CMD);
+    S.cmd = await svc.getCharacteristic(CHR_CMD);
+    S.cmd.addEventListener('characteristicvaluechanged', onNotify);
+    await S.cmd.startNotifications();
+    $('devName').textContent = S.device.name || 'Thermometer';
+    try { localStorage.setItem('thermo.name', S.device.name || ''); } catch (e) {}
+    setConnected(true);
+    status('Connected. Reading current values…');
+    await readLive();
+    status('Connected.');
+    readHistory(); // auto-download on connect
+  } catch (e) {
+    status('Connect failed: ' + e.message);
+    setConnected(false);
+  }
+}
+function onDisconnected() { setConnected(false); status('Disconnected.'); if (S.pending) S.pending.reject(new Error('disconnected')); }
+function setConnected(on) {
+  $('btnConnect').disabled = on; $('btnRead').disabled = !on;
+  $('btnTime').disabled = !on; $('btnDisconnect').disabled = !on;
+}
+
+async function readLive() {
+  try {
+    const env = await S.server.getPrimaryService(SVC_ENV);
+    S.live.temp = (await (await env.getCharacteristic(CHR_TEMP)).readValue()).getInt16(0, true) / 100;
+    S.live.hum = (await (await env.getCharacteristic(CHR_HUM)).readValue()).getUint16(0, true) / 100;
+  } catch (e) {}
+  try {
+    const b = await S.server.getPrimaryService(SVC_BATT);
+    S.live.batt = (await (await b.getCharacteristic(CHR_BATT)).readValue()).getUint8(0);
+  } catch (e) {}
+  render();
+}
+
+// ---- notifications from 0x1F1F ----
+function onNotify(ev) {
+  const v = ev.target.value;
+  if (v.byteLength < 1 || v.getUint8(0) !== CMD_LOGGER || !S.pending) return;
+  const p = S.pending;
+  if (v.byteLength >= 13) {
+    p.got.push({
+      t: v.getUint32(3, true),
+      temp: v.getInt16(7, true) / 100,
+      hum: v.getUint16(9, true) / 100,
+      mv: v.getUint16(11, true),
+    });
+    p.onRecord && p.onRecord();
+  } else if (v.byteLength === 3) {
+    p.resolve(p.got);   // end-of-block marker
+  }
+}
+
+// request records (from+1 .. to), newest first
+function requestBlock(from, to, onRecord) {
+  return new Promise(async (resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout')), 60000);
+    S.pending = { got: [], onRecord,
+      resolve: r => { clearTimeout(timer); S.pending = null; resolve(r); },
+      reject: e => { clearTimeout(timer); S.pending = null; reject(e); } };
+    try {
+      await S.cmd.writeValue(new Uint8Array([CMD_LOGGER, to & 255, to >> 8, from & 255, from >> 8]));
+    } catch (e) { S.pending && S.pending.reject(e); }
+  });
+}
+
+async function readHistory() {
+  if (!S.cmd || S.busy) return;
+  S.busy = true; $('btnRead').disabled = true;
+  const cutoffMs = Date.now() - cfg().days * 86400000;
+  const fresh = [];
+  $('prog').hidden = false; $('prog').value = 0;
+  try {
+    let from = 0, done = false;
+    while (!done && from < 65000) {
+      const to = Math.min(from + CHUNK, 65535);
+      const blk = await requestBlock(from, to, () => {
+        const n = fresh.length + (S.pending ? S.pending.got.length : 0);
+        const last = S.pending && S.pending.got[S.pending.got.length - 1];
+        if (last) $('prog').value = Math.min(1, (Date.now() - devToMs(last.t)) / (Date.now() - cutoffMs));
+        status(`Downloading… ${n} records`);
+      });
+      fresh.push(...blk);
+      if (blk.length < to - from) done = true;                          // reached end of memory
+      if (blk.length && devToMs(blk[blk.length - 1].t) < cutoffMs) done = true; // older than wanted
+      from = to;
+    }
+    // merge with cached data, dedupe by timestamp
+    const map = new Map(S.records.map(r => [r.t, r]));
+    fresh.forEach(r => map.set(r.t, r));
+    S.records = [...map.values()].sort((a, b) => a.t - b.t);
+    // keep at most 60 days in browser storage
+    const keepMs = Date.now() - 60 * 86400000;
+    S.records = S.records.filter(r => devToMs(r.t) >= keepMs);
+    saveRecords();
+    status(`Downloaded ${fresh.length} records.` + (fresh.length === 0 ? ' (Memory empty — check logging is enabled and the clock is set.)' : ''));
+  } catch (e) {
+    status('Download failed: ' + e.message);
+  }
+  $('prog').hidden = true; S.busy = false;
+  if (S.device && S.device.gatt.connected) $('btnRead').disabled = false;
+  render();
+}
+
+async function syncClock() {
+  let t = Math.floor(Date.now() / 1000);
+  if (cfg().local) t -= new Date().getTimezoneOffset() * 60;
+  try {
+    await S.cmd.writeValue(new Uint8Array([CMD_UTC_TIME, t & 255, (t >> 8) & 255, (t >> 16) & 255, (t >>> 24) & 255]));
+    status('Clock synced to ' + new Date().toLocaleString());
+  } catch (e) { status('Clock sync failed: ' + e.message); }
+}
+
+// ---- view ----
+function visible() {
+  const cutoff = Date.now() - cfg().days * 86400000;
+  return S.records.map(r => ({ ...r, ms: devToMs(r.t) })).filter(r => r.ms >= cutoff);
+}
+function smooth(arr, n) {
+  if (n <= 1) return arr;
+  return arr.map((p, i) => {
+    const s = arr.slice(Math.max(0, i - n + 1), i + 1);
+    return { x: p.x, y: s.reduce((a, b) => a + b.y, 0) / s.length };
+  });
+}
+function stats(a) {
+  if (!a.length) return null;
+  let mn = a[0], mx = a[0], sum = 0;
+  a.forEach(r => { if (r.v < mn.v) mn = r; if (r.v > mx.v) mx = r; sum += r.v; });
+  return { min: mn, max: mx, avg: sum / a.length };
+}
+const f1 = x => (Math.round(x * 10) / 10).toFixed(1);
+const when = ms => new Date(ms).toLocaleString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
+
+function render() {
+  const c = cfg(), data = visible(), u = unitLbl();
+  $('btnCsv').disabled = !data.length;
+  const latest = data[data.length - 1];
+  const curT = S.live.temp ?? latest?.temp, curH = S.live.hum ?? latest?.hum;
+  const ts = stats(data.map(r => ({ v: fmtT(r.temp), ms: r.ms })));
+  const hs = stats(data.map(r => ({ v: r.hum, ms: r.ms })));
+  const tile = (k, v, s='') => `<div class="tile"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${s}</div></div>`;
+  $('tiles').innerHTML =
+    tile('Now', curT != null ? f1(fmtT(curT)) + u : '–', curH != null ? f1(curH) + ' % RH' : '') +
+    tile(`Min (${c.days} d)`, ts ? f1(ts.min.v) + u : '–', ts ? when(ts.min.ms) : '') +
+    tile(`Max (${c.days} d)`, ts ? f1(ts.max.v) + u : '–', ts ? when(ts.max.ms) : '') +
+    tile('Average', ts ? f1(ts.avg) + u : '–', hs ? f1(hs.avg) + ' % RH avg' : '') +
+    tile('Battery', S.live.batt != null ? S.live.batt + ' %' : (latest ? (latest.mv / 1000).toFixed(2) + ' V' : '–'), data.length + ' records');
+
+  const tempPts = smooth(data.map(r => ({ x: r.ms, y: fmtT(r.temp) })), c.smooth);
+  const humPts = smooth(data.map(r => ({ x: r.ms, y: r.hum })), c.smooth);
+  const sets = [
+    { label: 'Temperature ' + u, data: tempPts, borderColor: '#e4572e', backgroundColor: '#e4572e', yAxisID: 'yT', pointRadius: 0, borderWidth: 2, tension: .25 },
+    { label: 'Humidity %', data: humPts, borderColor: '#2e86ab', backgroundColor: '#2e86ab', yAxisID: 'yH', pointRadius: 0, borderWidth: 2, tension: .25 },
+  ];
+  if (c.batt) sets.push({ label: 'Battery V', data: data.map(r => ({ x: r.ms, y: r.mv / 1000 })), borderColor: '#8a8f98', yAxisID: 'yB', pointRadius: 0, borderWidth: 1 });
+  const grid = getComputedStyle(document.body).getPropertyValue('--line');
+  const txt = getComputedStyle(document.body).getPropertyValue('--mute');
+  const opts = {
+    responsive: true, maintainAspectRatio: false, animation: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: { legend: { labels: { color: txt } } },
+    scales: {
+      x: { type: 'time', ticks: { color: txt, maxRotation: 0 }, grid: { color: grid } },
+      yT: { position: 'left', ticks: { color: '#e4572e' }, grid: { color: grid } },
+      yH: { position: 'right', ticks: { color: '#2e86ab' }, grid: { display: false } },
+      yB: { display: c.batt, position: 'right', ticks: { color: txt }, grid: { display: false } },
+    },
+  };
+  if (S.chart) { S.chart.data.datasets = sets; S.chart.options = opts; S.chart.update(); }
+  else S.chart = new Chart($('chart'), { type: 'line', data: { datasets: sets }, options: opts });
+
+  // daily summary
+  const days = {};
+  data.forEach(r => { const d = new Date(r.ms).toLocaleDateString(); (days[d] ||= []).push(r); });
+  $('daily').innerHTML = `<table><tr><th>Day</th><th>Min ${u}</th><th>Max ${u}</th><th>Avg ${u}</th><th>Avg %RH</th></tr>` +
+    Object.entries(days).reverse().map(([d, rs]) => {
+      const t = rs.map(r => fmtT(r.temp));
+      return `<tr><td>${d}</td><td>${f1(Math.min(...t))}</td><td>${f1(Math.max(...t))}</td><td>${f1(t.reduce((a,b)=>a+b,0)/t.length)}</td><td>${f1(rs.reduce((a,r)=>a+r.hum,0)/rs.length)}</td></tr>`;
+    }).join('') + '</table>';
+}
+
+function exportCsv() {
+  const u = unitLbl();
+  const rows = ['time,temperature_' + (u === '°F' ? 'F' : 'C') + ',humidity,battery_mV',
+    ...visible().map(r => [new Date(r.ms).toISOString(), f1(fmtT(r.temp)), r.hum.toFixed(2), r.mv].join(','))];
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([rows.join('\n')], { type: 'text/csv' }));
+  a.download = `thermometer_${new Date().toISOString().slice(0,10)}.csv`;
+  a.click();
+}
+
+// ---- wiring ----
+loadSettings();
+if (!navigator.bluetooth) { $('noBt').hidden = false; $('btnConnect').disabled = true; }
+$('btnConnect').onclick = connect;
+$('btnRead').onclick = readHistory;
+$('btnTime').onclick = syncClock;
+$('btnCsv').onclick = exportCsv;
+$('btnDisconnect').onclick = () => S.device && S.device.gatt.disconnect();
+SETTINGS.forEach(k => $(k).addEventListener('change', () => { saveSettings(); render(); }));
+render();
+</script>
+</body>
+</html>
