@@ -187,8 +187,9 @@ async function connect() {
           optionalServices: [SVC_CMD, SVC_ENV, SVC_BATT] };
     const dev = await navigator.bluetooth.requestDevice(opts);
     if (S.device && S.device !== dev) { try { S.device.gatt.disconnect(); } catch (_) {} }
-    S.device = dev; S.cmd = null; S.busy = false;
-    if (S.pending) S.pending.reject(new Error('switched device'));
+    S.session = (S.session || 0) + 1;      // invalidates any download still running for the old device
+    abortDownload('switched device');
+    S.device = dev; S.cmd = null;
     try { dev.addEventListener('gattserverdisconnected', () => { if (S.device === dev) onDisconnected(); }); } catch (_) {}
     selectDevice(dev.id || dev.name || 'device', dev.name || 'Thermometer');   // show this device's data, reset "Now"
 
@@ -209,7 +210,7 @@ async function connect() {
 
     setConnected(true);
     status('Connected. Reading current values…');
-    await readLive();
+    await withTimeout(readLive(), 6000).catch(() => {});
     // ask the pvvx firmware to push live measurements while connected
     try { await S.cmd.writeValue(new Uint8Array([CMD_MEASURE, 1])); } catch (_) {}
     status('Connected.');
@@ -225,7 +226,14 @@ async function connect() {
     setConnected(false);
   }
 }
-function onDisconnected() { setConnected(false); status('Disconnected.'); if (S.pending) S.pending.reject(new Error('disconnected')); }
+function onDisconnected() { setConnected(false); status('Disconnected.'); abortDownload('disconnected'); }
+// stop any running download and release the "busy" lock
+function abortDownload(why) {
+  if (S.pending) S.pending.reject(new Error(why));
+  if (S.timeWaiter) { const w = S.timeWaiter; S.timeWaiter = null; w(null); }
+  S.busy = false; $('prog').hidden = true;
+}
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
 function setConnected(on) {
   $('btnConnect').textContent = on ? 'Connect another' : 'Connect';
   $('btnRead').disabled = !on;
@@ -290,6 +298,8 @@ function requestBlock(from, to, onRecord) {
 
 async function readHistory() {
   if (!S.cmd || S.busy) return;
+  const sess = S.session;
+  const check = () => { if (sess !== S.session) throw new Error('aborted'); };
   S.busy = true; $('btnRead').disabled = true;
   const cutoffMs = Date.now() - cfg().days * 86400000;
   const fresh = [], cmdAtStart = S.cmd;
@@ -300,6 +310,7 @@ async function readHistory() {
     // records carry wrong times. Shift them by the clock error, then fix the clock.
     status('Checking device clock…');
     const devNow = await readDeviceTime();
+    check();
     if (devNow != null && Math.abs(expectedDevNow() - devNow) > 120) offset = expectedDevNow() - devNow;
     let from = 0, done = false;
     while (!done && from < 65000) {
@@ -310,6 +321,7 @@ async function readHistory() {
         if (last) $('prog').value = Math.min(1, (Date.now() - devToMs(last.t)) / (Date.now() - cutoffMs));
         status(`Downloading… ${n} records`);
       });
+      check();
       if (offset) blk.forEach(r => r.t += offset);
       fresh.push(...blk);
       if (blk.length < to - from) done = true;                          // reached end of memory
@@ -317,6 +329,7 @@ async function readHistory() {
       from = to;
     }
     // merge with cached data, dedupe by timestamp
+    check();
     if (S.cmd !== cmdAtStart) throw new Error('device changed during download');
     const map = new Map(S.records.map(r => [r.t, r]));
     fresh.forEach(r => map.set(r.t, r));
@@ -328,15 +341,17 @@ async function readHistory() {
     let msg = `Downloaded ${fresh.length} records.`;
     if (fresh.length === 0) msg += ' The thermometer memory is empty — check that history logging is enabled in the pvvx settings.';
     if (offset) {
-      await syncClock();
+      await syncClock(); check();
       msg += ` The device clock was off by ${fmtDur(Math.abs(offset))}; record times were corrected and the clock is now set.`;
     }
     const inRange = fresh.filter(r => devToMs(r.t) >= cutoffMs).length;
     if (fresh.length && !inRange) msg += ` None are from the last ${cfg().days} days (newest: ${new Date(devToMs(fresh[0].t)).toLocaleString()}).`;
     status(msg);
   } catch (e) {
+    if (sess !== S.session) return;           // a newer connection took over; it owns the UI now
     status('Download failed: ' + errMsg(e));
   }
+  if (sess !== S.session) return;
   $('prog').hidden = true; S.busy = false;
   if (S.device && S.device.gatt.connected) $('btnRead').disabled = false;
   render();
@@ -503,7 +518,8 @@ $('btnTime').onclick = syncClock;
 $('btnCsv').onclick = exportCsv;
 $('btnDisconnect').onclick = () => {
   try { S.device && S.device.gatt.disconnect(); } catch (_) {}
-  if (S.pending) S.pending.reject(new Error('disconnected'));
+  S.session = (S.session || 0) + 1;
+  abortDownload('disconnected');
   S.cmd = null; setConnected(false); status('Disconnected.');
 };
 SETTINGS.forEach(k => $(k).addEventListener('change', () => { saveSettings(); render(); }));
