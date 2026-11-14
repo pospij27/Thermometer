@@ -173,6 +173,7 @@ function errMsg(e) {
   try { const j = JSON.stringify(e); if (j && j !== '{}') return j; } catch (_) {}
   return String(e);
 }
+const fmtDur = s => s >= 86400 * 365 ? Math.round(s / 86400 / 365) + ' years' : s >= 86400 ? Math.round(s / 86400) + ' days' : s >= 3600 ? Math.round(s / 3600) + ' h' : Math.round(s / 60) + ' min';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ---- connection ----
@@ -226,7 +227,8 @@ async function connect() {
 }
 function onDisconnected() { setConnected(false); status('Disconnected.'); if (S.pending) S.pending.reject(new Error('disconnected')); }
 function setConnected(on) {
-  $('btnConnect').disabled = on; $('btnRead').disabled = !on;
+  $('btnConnect').textContent = on ? 'Connect another' : 'Connect';
+  $('btnRead').disabled = !on;
   $('btnTime').disabled = !on; $('btnDisconnect').disabled = !on;
 }
 
@@ -254,6 +256,9 @@ function onNotify(ev) {
     S.live.at = Date.now();
     clearTimeout(S.liveTimer); S.liveTimer = setTimeout(render, 300);
     return;
+  }
+  if (v.byteLength >= 5 && v.getUint8(0) === CMD_UTC_TIME && S.timeWaiter) {   // reply: device clock
+    S.timeWaiter(v.getUint32(1, true)); S.timeWaiter = null; return;
   }
   if (v.byteLength < 1 || v.getUint8(0) !== CMD_LOGGER || !S.pending) return;
   const p = S.pending;
@@ -289,7 +294,13 @@ async function readHistory() {
   const cutoffMs = Date.now() - cfg().days * 86400000;
   const fresh = [], cmdAtStart = S.cmd;
   $('prog').hidden = false; $('prog').value = 0;
+  let offset = 0;
   try {
+    // If the device clock is wrong (never set, or reset by a battery change), the stored
+    // records carry wrong times. Shift them by the clock error, then fix the clock.
+    status('Checking device clock…');
+    const devNow = await readDeviceTime();
+    if (devNow != null && Math.abs(expectedDevNow() - devNow) > 120) offset = expectedDevNow() - devNow;
     let from = 0, done = false;
     while (!done && from < 65000) {
       const to = Math.min(from + CHUNK, 65535);
@@ -299,6 +310,7 @@ async function readHistory() {
         if (last) $('prog').value = Math.min(1, (Date.now() - devToMs(last.t)) / (Date.now() - cutoffMs));
         status(`Downloading… ${n} records`);
       });
+      if (offset) blk.forEach(r => r.t += offset);
       fresh.push(...blk);
       if (blk.length < to - from) done = true;                          // reached end of memory
       if (blk.length && devToMs(blk[blk.length - 1].t) < cutoffMs) done = true; // older than wanted
@@ -313,13 +325,35 @@ async function readHistory() {
     const keepMs = Date.now() - 60 * 86400000;
     S.records = S.records.filter(r => devToMs(r.t) >= keepMs);
     saveRecords();
-    status(`Downloaded ${fresh.length} records.` + (fresh.length === 0 ? ' (Memory empty — check logging is enabled and the clock is set.)' : ''));
+    let msg = `Downloaded ${fresh.length} records.`;
+    if (fresh.length === 0) msg += ' The thermometer memory is empty — check that history logging is enabled in the pvvx settings.';
+    if (offset) {
+      await syncClock();
+      msg += ` The device clock was off by ${fmtDur(Math.abs(offset))}; record times were corrected and the clock is now set.`;
+    }
+    const inRange = fresh.filter(r => devToMs(r.t) >= cutoffMs).length;
+    if (fresh.length && !inRange) msg += ` None are from the last ${cfg().days} days (newest: ${new Date(devToMs(fresh[0].t)).toLocaleString()}).`;
+    status(msg);
   } catch (e) {
     status('Download failed: ' + errMsg(e));
   }
   $('prog').hidden = true; S.busy = false;
   if (S.device && S.device.gatt.connected) $('btnRead').disabled = false;
   render();
+}
+
+// "now" in the device's clock convention (local wall-clock or UTC seconds)
+function expectedDevNow() {
+  let t = Math.floor(Date.now() / 1000);
+  if (cfg().local) t -= new Date().getTimezoneOffset() * 60;
+  return t;
+}
+function readDeviceTime() {
+  return new Promise(async resolve => {
+    const timer = setTimeout(() => { S.timeWaiter = null; resolve(null); }, 3000);
+    S.timeWaiter = t => { clearTimeout(timer); resolve(t); };
+    try { await S.cmd.writeValue(new Uint8Array([CMD_UTC_TIME])); } catch (e) { clearTimeout(timer); S.timeWaiter = null; resolve(null); }
+  });
 }
 
 async function syncClock() {
@@ -330,6 +364,54 @@ async function syncClock() {
     status('Clock synced to ' + new Date().toLocaleString());
   } catch (e) { status('Clock sync failed: ' + errMsg(e)); }
 }
+
+// ---- chart plugin: shade every other day and draw a line + label at each midnight ----
+const dayBands = {
+  id: 'dayBands',
+  days(chart, fn) {
+    const x = chart.scales.x;
+    if (!x || !isFinite(x.min) || !isFinite(x.max)) return;
+    let d = new Date(x.min); d.setHours(0, 0, 0, 0);
+    while (d.getTime() <= x.max) {
+      const next = new Date(d); next.setDate(d.getDate() + 1);
+      fn(d, x.getPixelForValue(d.getTime()), x.getPixelForValue(next.getTime()), (x.max - x.min) / 86400000);
+      d = next;
+    }
+  },
+  // shade every other day and draw a dashed line at each midnight (behind the data)
+  beforeDatasetsDraw(chart) {
+    const a = chart.chartArea, ctx = chart.ctx, x = chart.scales.x;
+    const col = getComputedStyle(document.body).getPropertyValue('--mute').trim() || '#888';
+    ctx.save(); ctx.beginPath(); ctx.rect(a.left, a.top, a.right - a.left, a.bottom - a.top); ctx.clip();
+    this.days(chart, (d, x0, x1) => {
+      if (d.getDate() % 2 === 0) { ctx.fillStyle = 'rgba(128,128,128,0.10)'; ctx.fillRect(x0, a.top, x1 - x0, a.bottom - a.top); }
+      if (d.getTime() >= x.min) {
+        ctx.strokeStyle = col; ctx.globalAlpha = 0.7; ctx.setLineDash([4, 3]); ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(x0, a.top); ctx.lineTo(x0, a.bottom); ctx.stroke();
+        ctx.setLineDash([]); ctx.globalAlpha = 1;
+      }
+    });
+    ctx.restore();
+  },
+  // day names on top of the data, on a small background so lines don't hide them
+  afterDatasetsDraw(chart) {
+    const a = chart.chartArea, ctx = chart.ctx;
+    const css = getComputedStyle(document.body);
+    const col = css.getPropertyValue('--fg').trim() || '#222', bg = css.getPropertyValue('--card').trim() || '#fff';
+    ctx.save(); ctx.font = '600 11px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    this.days(chart, (d, x0, x1, span) => {
+      if (span > 3) return;   // longer ranges: the x-axis already labels each midnight
+      const l = Math.max(x0, a.left), r = Math.min(x1, a.right);
+      const txt = span <= 7 ? d.toLocaleDateString([], { weekday: 'short' }) + ' ' + d.getDate() : d.getDate() + '.' + (d.getMonth() + 1) + '.';
+      const w = ctx.measureText(txt).width + 8;
+      if (r - l < w + 2) return;
+      const cx = (l + r) / 2, cy = a.top + 10;
+      ctx.globalAlpha = 0.85; ctx.fillStyle = bg; ctx.fillRect(cx - w / 2, cy - 8, w, 16);
+      ctx.globalAlpha = 1; ctx.fillStyle = col; ctx.fillText(txt, cx, cy);
+    });
+    ctx.restore();
+  },
+};
 
 // ---- view ----
 function visible() {
@@ -381,14 +463,15 @@ function render() {
     interaction: { mode: 'index', intersect: false },
     plugins: { legend: { labels: { color: txt } } },
     scales: {
-      x: { type: 'time', ticks: { color: txt, maxRotation: 0 }, grid: { color: grid } },
+      x: { type: 'time', min: Date.now() - c.days * 86400000, max: Date.now(), time: { displayFormats: { minute: 'HH:mm', hour: 'HH:mm', day: 'EEE d', week: 'd MMM' }, tooltipFormat: 'EEE d MMM, HH:mm' },
+           ticks: { color: txt, maxRotation: 0 }, grid: { display: false } },
       yT: { position: 'left', ticks: { color: '#e4572e' }, grid: { color: grid } },
       yH: { position: 'right', ticks: { color: '#2e86ab' }, grid: { display: false } },
       yB: { display: c.batt, position: 'right', ticks: { color: txt }, grid: { display: false } },
     },
   };
   if (S.chart) { S.chart.data.datasets = sets; S.chart.options = opts; S.chart.update(); }
-  else S.chart = new Chart($('chart'), { type: 'line', data: { datasets: sets }, options: opts });
+  else S.chart = new Chart($('chart'), { type: 'line', data: { datasets: sets }, options: opts, plugins: [dayBands] });
 
   // daily summary
   const days = {};
@@ -418,7 +501,11 @@ $('devSel').onchange = e => { if (e.target.value && !(S.device && S.device.gatt.
 $('btnRead').onclick = readHistory;
 $('btnTime').onclick = syncClock;
 $('btnCsv').onclick = exportCsv;
-$('btnDisconnect').onclick = () => S.device && S.device.gatt.disconnect();
+$('btnDisconnect').onclick = () => {
+  try { S.device && S.device.gatt.disconnect(); } catch (_) {}
+  if (S.pending) S.pending.reject(new Error('disconnected'));
+  S.cmd = null; setConnected(false); status('Disconnected.');
+};
 SETTINGS.forEach(k => $(k).addEventListener('change', () => { saveSettings(); render(); }));
 render();
 </script>
