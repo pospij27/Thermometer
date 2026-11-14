@@ -68,6 +68,9 @@
       <label>Smoothing (points)
         <input id="setSmooth" type="number" min="1" step="1" value="1">
       </label>
+      <label>Show all devices
+        <select id="setAll"><option value="0">No</option><option value="1">Yes</option></select>
+      </label>
       <label>Show battery
         <select id="setBatt"><option value="0">No</option><option value="1">Yes</option></select>
       </label>
@@ -90,17 +93,19 @@
 
 <script>
 // ---- pvvx ATC_MiThermometer BLE protocol ----
-const SVC_CMD = 0x1f10, CHR_CMD = 0x1f1f;           // command/notify characteristic
+// full 128-bit UUID strings: some browsers (e.g. Bluefy on iOS) don't accept short numeric UUIDs
+const U = n => '0000' + n.toString(16).padStart(4, '0') + '-0000-1000-8000-00805f9b34fb';
+const SVC_CMD = U(0x1f10), CHR_CMD = U(0x1f1f);     // command/notify characteristic
 const CMD_UTC_TIME = 0x23, CMD_LOGGER = 0x35;        // set clock, read history
-const SVC_ENV = 0x181a, CHR_TEMP = 0x2a6e, CHR_HUM = 0x2a6f;
-const SVC_BATT = 0x180f, CHR_BATT = 0x2a19;
+const SVC_ENV = U(0x181a), CHR_TEMP = U(0x2a6e), CHR_HUM = U(0x2a6f);
+const SVC_BATT = U(0x180f), CHR_BATT = U(0x2a19);
 const CHUNK = 250;                                   // records per request
 
 const $ = id => document.getElementById(id);
 const S = { device:null, server:null, cmd:null, records:[], live:{}, chart:null };
 
 // ---- settings (saved in browser) ----
-const SETTINGS = ['setDays','setUnit','setClock','setSmooth','setBatt'];
+const SETTINGS = ['setDays','setUnit','setClock','setSmooth','setBatt','setAll'];
 function loadSettings() {
   try {
     const s = JSON.parse(localStorage.getItem('thermo.settings') || '{}');
@@ -131,22 +136,44 @@ function devToMs(t) {
 const fmtT = c => cfg().unit === 'F' ? c * 9 / 5 + 32 : c;
 const unitLbl = () => cfg().unit === 'F' ? '°F' : '°C';
 const status = t => $('status').textContent = t;
+// readable text from any kind of error (some browsers reject with strings or plain objects)
+function errMsg(e) {
+  if (e == null) return 'unknown error';
+  if (typeof e === 'string') return e;
+  const parts = [e.name, e.message].filter(Boolean);
+  if (parts.length) return parts.join(': ');
+  try { const j = JSON.stringify(e); if (j && j !== '{}') return j; } catch (_) {}
+  return String(e);
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ---- connection ----
 async function connect() {
+  let step = 'opening device chooser';
   try {
     status('Choose your thermometer…');
-    S.device = await navigator.bluetooth.requestDevice({
-      filters: [{ namePrefix: 'ATC' }, { namePrefix: 'LYWSD03' }, { namePrefix: 'MJWSD' }, { services: [SVC_CMD] }],
-      optionalServices: [SVC_CMD, SVC_ENV, SVC_BATT],
-    });
-    S.device.addEventListener('gattserverdisconnected', onDisconnected);
-    status('Connecting…');
-    S.server = await S.device.gatt.connect();
+    const opts = $('setAll').value === '1'
+      ? { acceptAllDevices: true, optionalServices: [SVC_CMD, SVC_ENV, SVC_BATT] }
+      : { filters: [{ namePrefix: 'ATC' }, { namePrefix: 'LYWSD03' }, { namePrefix: 'MJWSD' }, { namePrefix: 'MHO' }, { namePrefix: 'CGG' }],
+          optionalServices: [SVC_CMD, SVC_ENV, SVC_BATT] };
+    S.device = await navigator.bluetooth.requestDevice(opts);
+    try { S.device.addEventListener('gattserverdisconnected', onDisconnected); } catch (_) {}
+
+    // these thermometers often refuse the first connection attempt, so retry
+    for (let i = 1; i <= 3; i++) {
+      step = `connecting (attempt ${i}/3)`;
+      status('Connecting… ' + (i > 1 ? `attempt ${i}` : ''));
+      try { S.server = await S.device.gatt.connect(); break; }
+      catch (e) { if (i === 3) throw e; await sleep(1000); }
+    }
+    step = 'finding pvvx service 0x1F10';
     const svc = await S.server.getPrimaryService(SVC_CMD);
+    step = 'finding command characteristic 0x1F1F';
     S.cmd = await svc.getCharacteristic(CHR_CMD);
+    step = 'starting notifications';
     S.cmd.addEventListener('characteristicvaluechanged', onNotify);
     await S.cmd.startNotifications();
+
     $('devName').textContent = S.device.name || 'Thermometer';
     try { localStorage.setItem('thermo.name', S.device.name || ''); } catch (e) {}
     setConnected(true);
@@ -155,7 +182,13 @@ async function connect() {
     status('Connected.');
     readHistory(); // auto-download on connect
   } catch (e) {
-    status('Connect failed: ' + e.message);
+    const m = errMsg(e);
+    let hint = '';
+    if (/cancel/i.test(m)) hint = ' (no device was chosen — if your thermometer is not in the list, set "Show all devices" to Yes)';
+    else if (step.startsWith('connecting')) hint = ' (move closer, and make sure no other app or flasher page is connected to it)';
+    else if (step.startsWith('finding')) hint = ' (is this thermometer running the pvvx firmware?)';
+    status(`Connect failed while ${step}: ${m}${hint}`);
+    try { S.device && S.device.gatt.connected && S.device.gatt.disconnect(); } catch (_) {}
     setConnected(false);
   }
 }
@@ -240,7 +273,7 @@ async function readHistory() {
     saveRecords();
     status(`Downloaded ${fresh.length} records.` + (fresh.length === 0 ? ' (Memory empty — check logging is enabled and the clock is set.)' : ''));
   } catch (e) {
-    status('Download failed: ' + e.message);
+    status('Download failed: ' + errMsg(e));
   }
   $('prog').hidden = true; S.busy = false;
   if (S.device && S.device.gatt.connected) $('btnRead').disabled = false;
@@ -253,7 +286,7 @@ async function syncClock() {
   try {
     await S.cmd.writeValue(new Uint8Array([CMD_UTC_TIME, t & 255, (t >> 8) & 255, (t >> 16) & 255, (t >>> 24) & 255]));
     status('Clock synced to ' + new Date().toLocaleString());
-  } catch (e) { status('Clock sync failed: ' + e.message); }
+  } catch (e) { status('Clock sync failed: ' + errMsg(e)); }
 }
 
 // ---- view ----
