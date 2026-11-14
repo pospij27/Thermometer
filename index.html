@@ -58,6 +58,7 @@
 
   <div class="card">
     <div class="row">
+      <label>Device <select id="devSel" style="width:170px"></select></label>
       <label>Last days <input id="setDays" type="number" min="0.04" step="0.5" value="7"></label>
       <label>Unit
         <select id="setUnit"><option value="C">°C</option><option value="F">°F</option></select>
@@ -96,7 +97,7 @@
 // full 128-bit UUID strings: some browsers (e.g. Bluefy on iOS) don't accept short numeric UUIDs
 const U = n => '0000' + n.toString(16).padStart(4, '0') + '-0000-1000-8000-00805f9b34fb';
 const SVC_CMD = U(0x1f10), CHR_CMD = U(0x1f1f);     // command/notify characteristic
-const CMD_UTC_TIME = 0x23, CMD_LOGGER = 0x35;        // set clock, read history
+const CMD_UTC_TIME = 0x23, CMD_LOGGER = 0x35, CMD_MEASURE = 0x33;        // set clock, read history
 const SVC_ENV = U(0x181a), CHR_TEMP = U(0x2a6e), CHR_HUM = U(0x2a6f);
 const SVC_BATT = U(0x180f), CHR_BATT = U(0x2a19);
 const CHUNK = 250;                                   // records per request
@@ -110,15 +111,42 @@ function loadSettings() {
   try {
     const s = JSON.parse(localStorage.getItem('thermo.settings') || '{}');
     SETTINGS.forEach(k => { if (s[k] != null) $(k).value = s[k]; });
-    const r = JSON.parse(localStorage.getItem('thermo.records') || '[]');
-    if (Array.isArray(r)) S.records = r;
-    const n = localStorage.getItem('thermo.name'); if (n) $('devName').textContent = n;
+    localStorage.removeItem('thermo.records'); localStorage.removeItem('thermo.name'); // old shared store
+    const last = localStorage.getItem('thermo.lastDevice');
+    fillDeviceList();
+    if (last && devices()[last]) selectDevice(last);
   } catch (e) {}
 }
 function saveSettings() {
   try { localStorage.setItem('thermo.settings', JSON.stringify(Object.fromEntries(SETTINGS.map(k => [k, $(k).value])))); } catch (e) {}
 }
-function saveRecords() { try { localStorage.setItem('thermo.records', JSON.stringify(S.records)); } catch (e) {} }
+// every thermometer gets its own stored history, keyed by its Bluetooth id
+function devices() { try { return JSON.parse(localStorage.getItem('thermo.devices') || '{}'); } catch (e) { return {}; } }
+function saveRecords() {
+  if (!S.devId) return;
+  try {
+    localStorage.setItem('thermo.dev.' + S.devId, JSON.stringify(S.records));
+    const d = devices(); d[S.devId] = S.devName; localStorage.setItem('thermo.devices', JSON.stringify(d));
+    localStorage.setItem('thermo.lastDevice', S.devId);
+  } catch (e) {}
+  fillDeviceList();
+}
+function selectDevice(id, name) {
+  S.devId = id; S.devName = name || devices()[id] || 'Thermometer';
+  S.live = {};
+  try { S.records = JSON.parse(localStorage.getItem('thermo.dev.' + id) || '[]'); } catch (e) { S.records = []; }
+  if (!Array.isArray(S.records)) S.records = [];
+  $('devName').textContent = S.devName;
+  try { localStorage.setItem('thermo.lastDevice', id); } catch (e) {}
+  fillDeviceList();
+  render();
+}
+function fillDeviceList() {
+  const d = devices(), sel = $('devSel');
+  sel.innerHTML = Object.entries(d).map(([id, n]) => `<option value="${id}">${n || id}</option>`).join('')
+    || '<option value="">(none yet)</option>';
+  if (S.devId && d[S.devId]) sel.value = S.devId;
+}
 const cfg = () => ({
   days: Math.max(0.04, parseFloat($('setDays').value) || 7),
   unit: $('setUnit').value,
@@ -156,8 +184,12 @@ async function connect() {
       ? { acceptAllDevices: true, optionalServices: [SVC_CMD, SVC_ENV, SVC_BATT] }
       : { filters: [{ namePrefix: 'ATC' }, { namePrefix: 'LYWSD03' }, { namePrefix: 'MJWSD' }, { namePrefix: 'MHO' }, { namePrefix: 'CGG' }],
           optionalServices: [SVC_CMD, SVC_ENV, SVC_BATT] };
-    S.device = await navigator.bluetooth.requestDevice(opts);
-    try { S.device.addEventListener('gattserverdisconnected', onDisconnected); } catch (_) {}
+    const dev = await navigator.bluetooth.requestDevice(opts);
+    if (S.device && S.device !== dev) { try { S.device.gatt.disconnect(); } catch (_) {} }
+    S.device = dev; S.cmd = null; S.busy = false;
+    if (S.pending) S.pending.reject(new Error('switched device'));
+    try { dev.addEventListener('gattserverdisconnected', () => { if (S.device === dev) onDisconnected(); }); } catch (_) {}
+    selectDevice(dev.id || dev.name || 'device', dev.name || 'Thermometer');   // show this device's data, reset "Now"
 
     // these thermometers often refuse the first connection attempt, so retry
     for (let i = 1; i <= 3; i++) {
@@ -174,11 +206,11 @@ async function connect() {
     S.cmd.addEventListener('characteristicvaluechanged', onNotify);
     await S.cmd.startNotifications();
 
-    $('devName').textContent = S.device.name || 'Thermometer';
-    try { localStorage.setItem('thermo.name', S.device.name || ''); } catch (e) {}
     setConnected(true);
     status('Connected. Reading current values…');
     await readLive();
+    // ask the pvvx firmware to push live measurements while connected
+    try { await S.cmd.writeValue(new Uint8Array([CMD_MEASURE, 1])); } catch (_) {}
     status('Connected.');
     readHistory(); // auto-download on connect
   } catch (e) {
@@ -214,6 +246,15 @@ async function readLive() {
 // ---- notifications from 0x1F1F ----
 function onNotify(ev) {
   const v = ev.target.value;
+  if (ev.target !== S.cmd) return;             // stale notification from a previous device
+  if (v.byteLength >= 7 && v.getUint8(0) === CMD_MEASURE) {   // live: vbat, temp, humi
+    S.live.mv = v.getUint16(1, true);
+    S.live.temp = v.getInt16(3, true) / 100;
+    S.live.hum = v.getInt16(5, true) / 100;
+    S.live.at = Date.now();
+    clearTimeout(S.liveTimer); S.liveTimer = setTimeout(render, 300);
+    return;
+  }
   if (v.byteLength < 1 || v.getUint8(0) !== CMD_LOGGER || !S.pending) return;
   const p = S.pending;
   if (v.byteLength >= 13) {
@@ -246,7 +287,7 @@ async function readHistory() {
   if (!S.cmd || S.busy) return;
   S.busy = true; $('btnRead').disabled = true;
   const cutoffMs = Date.now() - cfg().days * 86400000;
-  const fresh = [];
+  const fresh = [], cmdAtStart = S.cmd;
   $('prog').hidden = false; $('prog').value = 0;
   try {
     let from = 0, done = false;
@@ -264,6 +305,7 @@ async function readHistory() {
       from = to;
     }
     // merge with cached data, dedupe by timestamp
+    if (S.cmd !== cmdAtStart) throw new Error('device changed during download');
     const map = new Map(S.records.map(r => [r.t, r]));
     fresh.forEach(r => map.set(r.t, r));
     S.records = [...map.values()].sort((a, b) => a.t - b.t);
@@ -323,7 +365,7 @@ function render() {
     tile(`Min (${c.days} d)`, ts ? f1(ts.min.v) + u : '–', ts ? when(ts.min.ms) : '') +
     tile(`Max (${c.days} d)`, ts ? f1(ts.max.v) + u : '–', ts ? when(ts.max.ms) : '') +
     tile('Average', ts ? f1(ts.avg) + u : '–', hs ? f1(hs.avg) + ' % RH avg' : '') +
-    tile('Battery', S.live.batt != null ? S.live.batt + ' %' : (latest ? (latest.mv / 1000).toFixed(2) + ' V' : '–'), data.length + ' records');
+    tile('Battery', S.live.batt != null ? S.live.batt + ' %' : S.live.mv ? (S.live.mv / 1000).toFixed(2) + ' V' : (latest ? (latest.mv / 1000).toFixed(2) + ' V' : '–'), data.length + ' records' + (S.live.at ? ' · live' : ''));
 
   const tempPts = smooth(data.map(r => ({ x: r.ms, y: fmtT(r.temp) })), c.smooth);
   const humPts = smooth(data.map(r => ({ x: r.ms, y: r.hum })), c.smooth);
@@ -372,6 +414,7 @@ function exportCsv() {
 loadSettings();
 if (!navigator.bluetooth) { $('noBt').hidden = false; $('btnConnect').disabled = true; }
 $('btnConnect').onclick = connect;
+$('devSel').onchange = e => { if (e.target.value && !(S.device && S.device.gatt.connected)) selectDevice(e.target.value); else fillDeviceList(); };
 $('btnRead').onclick = readHistory;
 $('btnTime').onclick = syncClock;
 $('btnCsv').onclick = exportCsv;
