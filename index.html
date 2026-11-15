@@ -408,21 +408,26 @@ const dayBands = {
     });
     ctx.restore();
   },
-  // day names on top of the data, on a small background so lines don't hide them
-  afterDatasetsDraw(chart) {
-    const a = chart.chartArea, ctx = chart.ctx;
-    const css = getComputedStyle(document.body);
-    const col = css.getPropertyValue('--fg').trim() || '#222', bg = css.getPropertyValue('--card').trim() || '#fff';
-    ctx.save(); ctx.font = '600 11px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    this.days(chart, (d, x0, x1, span) => {
-      if (span > 3) return;   // longer ranges: the x-axis already labels each midnight
-      const l = Math.max(x0, a.left), r = Math.min(x1, a.right);
-      const txt = span <= 7 ? d.toLocaleDateString([], { weekday: 'short' }) + ' ' + d.getDate() : d.getDate() + '.' + (d.getMonth() + 1) + '.';
-      const w = ctx.measureText(txt).width + 8;
-      if (r - l < w + 2) return;
-      const cx = (l + r) / 2, cy = a.top + 10;
-      ctx.globalAlpha = 0.85; ctx.fillStyle = bg; ctx.fillRect(cx - w / 2, cy - 8, w, 16);
-      ctx.globalAlpha = 1; ctx.fillStyle = col; ctx.fillText(txt, cx, cy);
+  // weekday name under the x-axis tick labels, centred in each day
+  afterDraw(chart) {
+    const a = chart.chartArea, ctx = chart.ctx, x = chart.scales.x;
+    const col = getComputedStyle(document.body).getPropertyValue('--fg').trim() || '#222';
+    ctx.save(); ctx.font = '600 11px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    ctx.fillStyle = col;
+    const y = x.bottom + 2;
+    // one name length for all days: the longest where every weekday fits a full day ("Monday" → "Mon" → "M")
+    const dayPx = x.getPixelForValue(x.min + 86400000) - x.getPixelForValue(x.min) - 4;
+    const ref = [...Array(7)].map((_, i) => new Date(2024, 0, 1 + i));   // Mon..Sun
+    const fits = (f, room) => ref.every(r => ctx.measureText(r.toLocaleDateString([], { weekday: f })).width <= room);
+    const formats = ['long', 'short', 'narrow'];
+    const best = formats.findIndex(f => fits(f, dayPx));
+    if (best < 0) { ctx.restore(); return; }
+    this.days(chart, (d, x0, x1) => {
+      const l = Math.max(x0, a.left), r = Math.min(x1, a.right), room = r - l - 4;
+      // partial days at the edges: same length if it fits, otherwise shorter, otherwise none
+      const txt = formats.slice(best).map(f => d.toLocaleDateString([], { weekday: f }))
+        .find(t => ctx.measureText(t).width <= room);
+      if (txt) ctx.fillText(txt, (l + r) / 2, y);
     });
     ctx.restore();
   },
@@ -475,10 +480,11 @@ function render() {
   const txt = getComputedStyle(document.body).getPropertyValue('--mute');
   const opts = {
     responsive: true, maintainAspectRatio: false, animation: false,
+    layout: { padding: { bottom: 16 } },   // room for weekday names under the axis
     interaction: { mode: 'index', intersect: false },
     plugins: { legend: { labels: { color: txt } } },
     scales: {
-      x: { type: 'time', min: Date.now() - c.days * 86400000, max: Date.now(), time: { displayFormats: { minute: 'HH:mm', hour: 'HH:mm', day: 'EEE d', week: 'd MMM' }, tooltipFormat: 'EEE d MMM, HH:mm' },
+      x: { type: 'time', min: Date.now() - c.days * 86400000, max: Date.now(), time: { displayFormats: { minute: 'HH:mm', hour: 'HH:mm', day: 'd.M.', week: 'd.M.' }, tooltipFormat: 'EEE d MMM, HH:mm' },
            ticks: { color: txt, maxRotation: 0 }, grid: { display: false } },
       yT: { position: 'left', ticks: { color: '#e4572e' }, grid: { color: grid } },
       yH: { position: 'right', ticks: { color: '#2e86ab' }, grid: { display: false } },
